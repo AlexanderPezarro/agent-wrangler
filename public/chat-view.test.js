@@ -511,17 +511,17 @@ test('an empty composer sends nothing', async () => {
   assert.equal(sent.some((m) => m.type === 'message'), false);
 });
 
-test('sending retains the composer until its matching delivery acknowledgement', async () => {
+test('sending empties the composer at once and keeps it locked until the matching acknowledgement', async () => {
   const { view, input, sent } = await mountView();
   view.mount('sess-1');
   view.setStatus('idle');
   input.value = 'once';
   input.dispatchEvent({ type: 'keydown', key: 'Enter', shiftKey: false, preventDefault() {} });
   const message = sent.find((m) => m.type === 'message');
-  assert.equal(input.value, 'once');
+  assert.equal(input.value, '');
   assert.equal(input.disabled, true);
   view.onMessageResult({ requestId: 'other', sessionId: 'sess-1', ok: true });
-  assert.equal(input.value, 'once');
+  assert.equal(input.disabled, true);
   view.onMessageResult({ requestId: message.requestId, sessionId: 'sess-1', ok: true });
   assert.equal(input.value, '');
   assert.equal(input.disabled, false);
@@ -615,9 +615,51 @@ test('pending delivery in one session does not block another session', async () 
   const second = sent.filter((m) => m.type === 'message').at(-1);
   assert.notEqual(second.requestId, first.requestId);
   view.onMessageResult({ requestId: first.requestId, sessionId: 'sess-1', ok: true });
-  assert.equal(input.value, 'second');
   view.onMessageResult({ requestId: second.requestId, sessionId: 'sess-2', ok: true });
   assert.equal(input.value, '');
+});
+
+// The fake DOM's appendChild does not detach from the old parent, so a re-pinned
+// node is listed twice; a real DOM moves it.
+const echoNodes = (byId) => [...new Set(byId.get('chat-stream').children.flatMap((c) => (c.className === 'chat-queue' ? c.children : [c])))].filter((c) => c.className === 'chat-user');
+
+test('a sent prompt appears at once as a dashed bubble, queued once delivered, until the transcript has it', async () => {
+  const { view, input, sent, byId } = await mountView();
+  view.mount('sess-1');
+  view.setStatus('idle');
+  input.value = 'hello there';
+  send(input);
+  const [bubble] = echoNodes(byId);
+  assert.equal(bubble.children.map((c) => c.textContent ?? c.data ?? c.nodeValue).join(''), 'hello there');
+  assert.equal(bubble.dataset.pending, '1');
+  view.onMessageResult({ requestId: sent.find((m) => m.type === 'message').requestId, sessionId: 'sess-1', ok: true });
+  assert.equal(bubble.dataset.pending, 'queued');
+  assert.equal(echoNodes(byId).length, 1);
+});
+
+test('the transcript copy of a prompt replaces its local echo', async () => {
+  const { view, input, sent, byId } = await mountView();
+  view.mount('sess-1');
+  view.setStatus('idle');
+  input.value = 'hello there';
+  send(input);
+  view.onMessageResult({ requestId: sent.find((m) => m.type === 'message').requestId, sessionId: 'sess-1', ok: true });
+  const chat = sent.find((m) => m.type === 'chat');
+  assert.equal(echoNodes(byId).length, 1);
+  view.onChatReply({ sessionId: 'sess-1', token: chat.token, offset: 10, events: [{ kind: 'user', text: 'hello there' }] });
+  assert.equal(echoNodes(byId).length, 1);
+  assert.equal(echoNodes(byId)[0].dataset.pending, undefined);
+});
+
+test('a failed delivery removes the echo and restores the draft', async () => {
+  const { view, input, sent, byId } = await mountView();
+  view.mount('sess-1');
+  view.setStatus('idle');
+  input.value = 'keep me';
+  send(input);
+  view.onMessageResult({ requestId: sent.find((m) => m.type === 'message').requestId, sessionId: 'sess-1', ok: false, error: 'nope' });
+  assert.equal(echoNodes(byId).length, 0);
+  assert.equal(input.value, 'keep me');
 });
 
 
@@ -971,4 +1013,141 @@ test('clearing needs-you re-enables the composer and hides the bar', async () =>
   const bar = byId.get('chat-notice-bar');
   assert.equal(bar.hidden, true);
   assert.equal(input.disabled, false);
+});
+
+test('the suggested prompt stays hidden while a sent prompt is still echoed locally', async () => {
+  const { view, input, sent, byId } = await mountView();
+  view.mount('sess-1');
+  view.setStatus('idle');
+  const chat = sent.find((m) => m.type === 'chat');
+  view.onChatReply({ sessionId: 'sess-1', token: chat.token, offset: 1, events: [], suggestion: 'commit and open a PR' });
+  assert.equal(byId.get('chat-suggestion').hidden, false);
+  input.value = 'hi';
+  send(input);
+  assert.equal(byId.get('chat-suggestion').hidden, true);
+  view.onMessageResult({ requestId: sent.find((m) => m.type === 'message').requestId, sessionId: 'sess-1', ok: true });
+  assert.equal(byId.get('chat-suggestion').hidden, true);
+  view.onChatReply({ sessionId: 'sess-1', token: chat.token, offset: 5, events: [{ kind: 'user', text: 'hi' }], suggestion: 'commit and open a PR' });
+  assert.equal(byId.get('chat-suggestion').hidden, false);
+});
+
+test('a queued prompt stays below output that arrives after it was sent', async () => {
+  const { view, input, sent, byId } = await mountView();
+  view.mount('sess-1');
+  view.setStatus('idle');
+  input.value = 'later';
+  send(input);
+  view.onMessageResult({ requestId: sent.find((m) => m.type === 'message').requestId, sessionId: 'sess-1', ok: true });
+  const chat = sent.find((m) => m.type === 'chat');
+  view.onChatReply({ sessionId: 'sess-1', token: chat.token, offset: 3, events: [{ kind: 'assistant', text: 'still working' }] });
+  const kids = byId.get('chat-stream').children;
+  assert.equal(kids.at(-1).className, 'chat-queue');
+  assert.ok(kids.some((k) => k.className !== 'chat-user'));
+});
+
+test('queued prompts survive leaving the view and coming back', async () => {
+  const { view, input, sent, byId } = await mountView();
+  view.mount('sess-1');
+  view.setStatus('idle');
+  input.value = 'wait for me';
+  send(input);
+  view.onMessageResult({ requestId: sent.find((m) => m.type === 'message').requestId, sessionId: 'sess-1', ok: true });
+  view.unmount();
+  assert.equal(echoNodes(byId).length, 0);
+  view.mount('sess-1');
+  assert.equal(echoNodes(byId).length, 1);
+  const [bubble] = echoNodes(byId);
+  assert.equal(bubble.dataset.pending, 'queued');
+  const chat = sent.filter((m) => m.type === 'chat').at(-1);
+  view.onChatReply({ sessionId: 'sess-1', token: chat.token, offset: 4, events: [{ kind: 'user', text: 'wait for me', ts: Date.now() - 60000 }] });
+  assert.equal(echoNodes(byId)[0], bubble);
+  view.onChatReply({ sessionId: 'sess-1', token: chat.token, offset: 9, events: [{ kind: 'user', text: 'wait for me', ts: Date.now() + 1000 }] });
+  assert.equal(echoNodes(byId).length, 2);
+  assert.equal(echoNodes(byId).some((n) => n.dataset.pending), false);
+});
+
+test('several queued prompts share one tray with a single heading', async () => {
+  const { view, input, sent, byId } = await mountView();
+  view.mount('sess-1');
+  view.setStatus('idle');
+  for (const text of ['abc', 'foobar']) {
+    input.value = text;
+    send(input);
+    view.onMessageResult({ requestId: sent.filter((m) => m.type === 'message').at(-1).requestId, sessionId: 'sess-1', ok: true });
+  }
+  const trays = [...new Set(byId.get('chat-stream').children.filter((c) => c.className === 'chat-queue'))];
+  assert.equal(trays.length, 1);
+  assert.equal(new Set(echoNodes(byId)).size, 2);
+  assert.match(trays[0].children[0].textContent, /Queued · 2 waiting/);
+});
+
+test('a send hands focus back to the composer once delivery is acknowledged', async () => {
+  const { view, input, sent, document } = await mountView();
+  view.mount('sess-1');
+  view.setStatus('idle');
+  let focused = 0;
+  input.focus = () => { focused += 1; };
+  document.activeElement = input;
+  input.value = 'hello';
+  send(input);
+  assert.equal(input.disabled, true);
+  document.activeElement = document.body;
+  view.onMessageResult({ requestId: sent.find((m) => m.type === 'message').requestId, sessionId: 'sess-1', ok: true });
+  assert.equal(input.disabled, false);
+  assert.equal(focused, 1);
+});
+
+test('a prompt with an attachment is matched through the TUI image marker', async () => {
+  const { echoMatchesEvent } = await import('./chat-view.js');
+  const echo = { text: 'Explain this', images: ['a.png', 'b.png'], sentAt: 1000 };
+  assert.equal(echoMatchesEvent(echo, { text: '[Image #1][Image #2]Explain this', ts: 1500 }), true);
+  assert.equal(echoMatchesEvent(echo, { text: 'Explain this', ts: 1500 }), true);
+  assert.equal(echoMatchesEvent({ text: '', images: ['a.png'], sentAt: 1000 }, { text: '[Image #1]', ts: 1500 }), true);
+  assert.equal(echoMatchesEvent({ text: '', images: ['a.png'], sentAt: 1000 }, { text: '', ts: 1500 }), false);
+  assert.equal(echoMatchesEvent({ text: '[Image #1] shows the error', images: ['a.png'], sentAt: 1000 }, { text: '[Image #2][Image #1] shows the error', ts: 1500 }), true);
+  const literal = { text: 'Compare [Image #1] with [Image #2]', images: [], sentAt: 1000 };
+  assert.equal(echoMatchesEvent(literal, { text: 'Compare [Image #1] with [Image #2]', ts: 1500 }), true);
+  assert.equal(echoMatchesEvent({ ...literal, images: ['a.png', 'b.png'] }, { text: '[Image #1][Image #2]Compare [Image #1] with [Image #2]', ts: 1500 }), true);
+});
+
+test('history replayed by a remount cannot acknowledge a newer identical prompt', async () => {
+  const { view, input, sent, byId } = await mountView();
+  view.mount('sess-1');
+  view.setStatus('idle');
+  const sendOnce = () => {
+    input.value = 'continue';
+    send(input);
+    view.onMessageResult({ requestId: sent.filter((m) => m.type === 'message').at(-1).requestId, sessionId: 'sess-1', ok: true });
+  };
+  sendOnce();
+  const ts = Date.now() + 100;
+  const reply = () => {
+    const chat = sent.filter((m) => m.type === 'chat').at(-1);
+    view.onChatReply({ sessionId: 'sess-1', token: chat.token, offset: 100, events: [{ kind: 'user', text: 'continue', ts }] });
+  };
+  reply();
+  sendOnce();
+  view.unmount();
+  view.mount('sess-1');
+  reply();
+  assert.equal(echoNodes(byId).filter((n) => n.dataset.pending).length, 1);
+});
+
+test('a terminal-origin prompt already shown cannot acknowledge a later identical send', async () => {
+  const { view, input, sent, byId } = await mountView();
+  view.mount('sess-1');
+  view.setStatus('idle');
+  const ts = Date.now();
+  const reply = () => {
+    const chat = sent.filter((m) => m.type === 'chat').at(-1);
+    view.onChatReply({ sessionId: 'sess-1', token: chat.token, offset: 50, events: [{ kind: 'user', text: 'continue', ts }] });
+  };
+  reply();
+  input.value = 'continue';
+  send(input);
+  view.onMessageResult({ requestId: sent.find((m) => m.type === 'message').requestId, sessionId: 'sess-1', ok: true });
+  view.unmount();
+  view.mount('sess-1');
+  reply();
+  assert.equal(echoNodes(byId).filter((n) => n.dataset.pending).length, 1);
 });

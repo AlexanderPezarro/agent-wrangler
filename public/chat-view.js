@@ -41,6 +41,24 @@ export function isHumanTypedUserItem(item) {
   return !String(item.event?.text || '').startsWith(AGENT_WRANGLER_NOTICE_PREFIX);
 }
 
+const LEADING_IMAGE_MARKER = /^\[Image #\d+\]\s*/;
+
+// Whether a transcript user event is the recording of a locally echoed prompt.
+export function echoMatchesEvent(echo, event) {
+  // Mounting reads a window of history, which may hold an older prompt with the
+  // same words ("yes", "continue") — only one recorded after the send is ours.
+  if (Number.isFinite(event.ts) && event.ts < echo.sentAt - 2000) return false;
+  let text = String(event.text || '').trim();
+  if (text === echo.text) return Boolean(text) || echo.images.length === 0 || (Array.isArray(event.images) && event.images.length > 0);
+  // The TUI prepends one `[Image #N]` marker per attachment, so at most that many
+  // leading markers are dropped; any the human typed themselves stay in the prose.
+  for (let i = 0; i < echo.images.length && LEADING_IMAGE_MARKER.test(text); i += 1) {
+    text = text.replace(LEADING_IMAGE_MARKER, '').trim();
+    if (text === echo.text) return true;
+  }
+  return false;
+}
+
 export function initChatView({ send, onSubagentClick, onOpenDiff, onGoTerminal, onPickModel, onOpenFile, cwdFor } = {}) {
   const wrap = document.getElementById('chat-wrap');
   const stream = document.getElementById('chat-stream');
@@ -255,6 +273,89 @@ export function initChatView({ send, onSubagentClick, onOpenDiff, onGoTerminal, 
   let restoreOverDraft = false;
   let messageSeq = 0;
   const pendingMessages = new Map();
+  // Local echoes of sent prompts, per session, newest last. Each is drawn the
+  // moment Send is pressed (dashed) and stays until the transcript records the
+  // prompt, which then replaces it. Held by session rather than by the DOM so
+  // leaving the view (to the terminal, or another card) and coming back redraws
+  // them; `node` is null whenever the stream they were drawn in has been cleared.
+  const echoStore = new Map();
+  const ECHO_MAX_AGE_MS = 60 * 60 * 1000;
+  const echoList = () => echoStore.get(sessionId) || [];
+
+  function detachEchoNodes() {
+    for (const list of echoStore.values()) {
+      for (const e of list) {
+        e.node?.remove();
+        e.node = null;
+      }
+    }
+  }
+
+  function removeEcho(echo) {
+    echo.node?.remove();
+    const list = (echoStore.get(echo.sessionId) || []).filter((e) => e !== echo);
+    if (list.length) echoStore.set(echo.sessionId, list);
+    else echoStore.delete(echo.sessionId);
+    if (echo.sessionId === sessionId) pinTail();
+  }
+
+  function pruneEchoes() {
+    const cutoff = Date.now() - ECHO_MAX_AGE_MS;
+    for (const list of [...echoStore.values()]) for (const e of list) if (e.sentAt < cutoff) removeEcho(e);
+  }
+
+  // One tray holds every prompt sent but not yet recorded, so several queued
+  // prompts read as a single waiting group rather than a run of separate messages.
+  const queueTray = document.createElement('div');
+  queueTray.className = 'chat-queue';
+  const queueHead = document.createElement('div');
+  queueHead.className = 'chat-queue-head';
+  queueTray.appendChild(queueHead);
+
+  // The tail of the stream is always the working row, then the tray. Queued
+  // prompts belong after everything the agent is still producing, whatever order
+  // the nodes were appended in.
+  function pinTail() {
+    if (live) stream.appendChild(live);
+    const list = echoList();
+    if (!list.length) {
+      queueTray.remove();
+      return;
+    }
+    for (const e of list) {
+      if (!e.node) {
+        e.node = dom.itemNode({
+          type: 'user',
+          event: { text: e.text, images: e.images.map((name) => ({ label: 'Image', name })) },
+        });
+        e.node.dataset.pending = e.state;
+      }
+      queueTray.appendChild(e.node);
+    }
+    const queued = list.filter((e) => e.state === 'queued').length;
+    queueHead.textContent = queued
+      ? `Queued · ${queued} waiting for the agent`
+      : 'Sending…';
+    stream.appendChild(queueTray);
+  }
+
+  const eventKey = (event) => `${event.ts}|${event.text}`;
+  // Events that have already acknowledged a send, per session, so history replayed
+  // by a remount cannot acknowledge a newer identical prompt.
+  const ackedEvents = new Map();
+  const ACKED_MAX = 200;
+
+  function echoMatches(echo, item) {
+    if (ackedEvents.get(echo.sessionId)?.has(eventKey(item.event || {}))) return false;
+    return echoMatchesEvent(echo, item.event || {});
+  }
+
+  function noteAcked(sessionId, event) {
+    const set = ackedEvents.get(sessionId) || new Set();
+    set.add(eventKey(event));
+    if (set.size > ACKED_MAX) set.delete(set.values().next().value);
+    ackedEvents.set(sessionId, set);
+  }
 
   function saveDraft(id) {
     if (!id) return;
@@ -407,7 +508,7 @@ export function initChatView({ send, onSubagentClick, onOpenDiff, onGoTerminal, 
     }
     // Re-appended every render so it stays last even when this call follows an
     // appendItems that added nodes after it.
-    stream.appendChild(live);
+    pinTail();
     paintLive();
     if (stick) stream.scrollTop = stream.scrollHeight;
   }
@@ -443,21 +544,30 @@ export function initChatView({ send, onSubagentClick, onOpenDiff, onGoTerminal, 
     // discard something the human was in the middle of writing — and while
     // blocked, when the composer is disabled and the only useful action is
     // answering the prompt in the pane.
-    const show = Boolean(lastSuggestion) && !input.value.trim() && !blockedByNeedsYou();
+    const show = Boolean(lastSuggestion) && !input.value.trim() && !blockedByNeedsYou() && !echoList().length;
     suggestionBtn.hidden = !show;
     if (show) suggestionBtn.textContent = lastSuggestion;
   }
 
   // An attached image is a complete prompt on its own (the TUI submits the bare
   // `[Image #1]`), so Send has to stay live for an empty box that holds one.
+  let refocusInput = false;
+
   function renderSendability() {
     if (sessionId && pendingMessages.has(sessionId)) {
+      // Disabling a focused field blurs it for good, so note it to hand focus back.
+      if (document.activeElement === input) refocusInput = true;
       input.disabled = true;
       sendBtn.disabled = true;
       return;
     }
     if (blockedByNeedsYou()) return; // setStatus owns the button while blocked
     input.disabled = false;
+    if (refocusInput) {
+      refocusInput = false;
+      // Only when focus is still nowhere: a click elsewhere meanwhile is the user's call.
+      if (!document.activeElement || document.activeElement === document.body) input.focus();
+    }
     sendBtn.disabled = !input.value.trim() && !attachments.length;
   }
 
@@ -469,12 +579,13 @@ export function initChatView({ send, onSubagentClick, onOpenDiff, onGoTerminal, 
     // is peer-only. Only NAMES go over the wire — the server resolves them back
     // to paths inside this session's own pastes folder.
     const requestId = `${requestEra}#${++messageSeq}`;
-    const pending = { requestId, sessionId, clearComposer: paneRestoreArmed };
+    const pending = { requestId, sessionId, clearComposer: paneRestoreArmed, draft: { text: input.value, attachments: attachments.slice() } };
     pendingMessages.set(sessionId, pending);
     if (pending.clearComposer) {
       paneRestoreArmed = false;
       restoreToken = null;
     }
+    const sentAttachments = attachments;
     const accepted = send({
       type: 'message', sessionId, text,
       requestId,
@@ -485,9 +596,25 @@ export function initChatView({ send, onSubagentClick, onOpenDiff, onGoTerminal, 
       pendingMessages.delete(sessionId);
       if (pending.clearComposer) paneRestoreArmed = true;
       setPasteNote('Not sent: connection unavailable.');
+    } else {
+      setPasteNote('Sending…');
+      echoSent(pending, text, sentAttachments);
+      input.value = '';
+      input.style.height = 'auto';
+      attachments = [];
+      renderAttachments();
     }
-    else setPasteNote('Sending…');
     renderSendability();
+  }
+
+  function echoSent(pending, text, sentAttachments) {
+    const echo = { sessionId: pending.sessionId, requestId: pending.requestId, text, images: sentAttachments.map((a) => a.name), sentAt: Date.now(), state: '1', node: null };
+    pending.echo = echo;
+    echoStore.set(echo.sessionId, [...echoList(), echo]);
+    pinTail();
+    stream.scrollTop = stream.scrollHeight;
+    updateJumpVisibility();
+    renderSuggestion();
   }
 
   sendBtn.addEventListener('click', submit);
@@ -691,7 +818,15 @@ export function initChatView({ send, onSubagentClick, onOpenDiff, onGoTerminal, 
       // A mail/PR-nudge item still leaves the PREVIOUS tracked node in place —
       // it must not overwrite a genuine human message with one that only
       // looks like one, even though it renders in the same bubble style.
-      if (item.type === 'user' && isHumanTypedUserItem(item)) lastUserEl = node;
+      if (item.type === 'user' && isHumanTypedUserItem(item)) {
+        lastUserEl = node;
+        const hit = echoList().find((e) => echoMatches(e, item));
+        noteAcked(sessionId, item.event);
+        if (hit) {
+          removeEcho(hit);
+          renderSuggestion();
+        }
+      }
       if (item.type === 'subagent') {
         node.addEventListener('click', () => onSubagentClick?.(sessionId, item.event.id));
       }
@@ -716,8 +851,7 @@ export function initChatView({ send, onSubagentClick, onOpenDiff, onGoTerminal, 
       }
       stream.appendChild(node);
     }
-    // Keep the live row last: these nodes were just appended after it.
-    if (live) stream.appendChild(live);
+    pinTail();
     if (stick) stream.scrollTop = stream.scrollHeight;
     updateJumpVisibility();
   }
@@ -762,6 +896,7 @@ export function initChatView({ send, onSubagentClick, onOpenDiff, onGoTerminal, 
     offset = null;
     clearBurst();
     stream.textContent = '';
+    detachEchoNodes();
     // Same dangling-reference reasoning as `live` below: the node this pointed
     // at was just cleared out of the document.
     lastUserEl = null;
@@ -773,6 +908,7 @@ export function initChatView({ send, onSubagentClick, onOpenDiff, onGoTerminal, 
     clearInterval(tick);
     tick = null;
     renderLive();
+    pinTail();
     poll();
   }
 
@@ -783,21 +919,30 @@ export function initChatView({ send, onSubagentClick, onOpenDiff, onGoTerminal, 
       const current = sessionId === msg.sessionId;
       pendingMessages.delete(msg.sessionId);
       if (!msg.ok) {
+        if (pending.echo) {
+          removeEcho(pending.echo);
+          renderSuggestion();
+        }
         if (current && pending.clearComposer) paneRestoreArmed = true;
         if (current) {
+          input.value = pending.draft.text;
+          attachments = pending.draft.attachments.slice();
+          input.dispatchEvent(new Event('input'));
+          renderAttachments();
           const prefix = msg.outcome === 'unknown' ? 'Delivery status unknown' : 'Not sent';
           setPasteNote(`${prefix}: ${msg.error || 'check the terminal before sending again'}`);
           renderSendability();
-        }
+        } else drafts.set(msg.sessionId, pending.draft);
         return;
       }
+      if (pending.echo) {
+        pending.echo.state = 'queued';
+        if (pending.echo.node) pending.echo.node.dataset.pending = 'queued';
+        if (current) pinTail();
+      }
       if (current) {
-        input.value = '';
-        input.style.height = 'auto';
-        attachments = [];
         drafts.delete(msg.sessionId);
         setPasteNote(null);
-        renderAttachments();
         renderSendability();
         kickBurst();
       } else drafts.delete(msg.sessionId);
@@ -858,6 +1003,8 @@ export function initChatView({ send, onSubagentClick, onOpenDiff, onGoTerminal, 
       generation += 1;
       requestEra += 1;
       stream.textContent = '';
+      detachEchoNodes();
+      pruneEchoes();
       lastUserEl = null;
       jumpBtn.hidden = true;
       // A new era starts with no known pending call or status — otherwise the
@@ -899,6 +1046,7 @@ export function initChatView({ send, onSubagentClick, onOpenDiff, onGoTerminal, 
       clearInterval(tick);
       tick = null;
       renderLive();
+      pinTail();
       renderSuggestion();
       // Cleared, not carried: the model belongs to the session being left. The
       // caller re-seeds it straight after mount (see renderSidebar in app.js).
@@ -923,6 +1071,7 @@ export function initChatView({ send, onSubagentClick, onOpenDiff, onGoTerminal, 
       requestEra += 1;
       wrap.hidden = true;
       stream.textContent = '';
+      detachEchoNodes();
       lastUserEl = null;
       jumpBtn.hidden = true;
       lastPending = null;
