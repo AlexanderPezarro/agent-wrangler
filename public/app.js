@@ -1154,6 +1154,19 @@ function flashRestoredTask(taskId) {
 // Workflow boxes the user has collapsed (hiding their worker spine), keyed on the
 // orchestrator card id. Client-only view state — like unread, it's a personal
 // "fold this away" cue, persisted to localStorage so it survives a refresh.
+const COLLAPSED_SNOOZED_KEY = 'wrangler.collapsedSnoozed';
+const collapsedSnoozed = (() => {
+  try { return new Set(JSON.parse(localStorage.getItem(COLLAPSED_SNOOZED_KEY)) || []); } catch { return new Set(); }
+})();
+function toggleSnoozedCollapse(tileKey) {
+  if (collapsedSnoozed.has(tileKey)) collapsedSnoozed.delete(tileKey);
+  else collapsedSnoozed.add(tileKey);
+  try { localStorage.setItem(COLLAPSED_SNOOZED_KEY, JSON.stringify([...collapsedSnoozed])); } catch {}
+  selectedNewSlot = null;
+  const hadFocus = Boolean(document.activeElement?.closest?.('.snooze-toggle'));
+  if (currentView === 'grid') renderGrid();
+  if (hadFocus) document.querySelector(`.snooze-toggle[data-tile="${CSS.escape(tileKey)}"]`)?.focus();
+}
 const COLLAPSED_WF_KEY = 'wrangler.collapsedWorkflows';
 const collapsedWorkflows = (() => {
   try { return new Set(JSON.parse(localStorage.getItem(COLLAPSED_WF_KEY)) || []); } catch { return new Set(); }
@@ -1315,7 +1328,7 @@ function flashPr(url) {
 // status helpers; cardCtx() snapshots them for a render pass.
 function cardCtx() {
   return {
-    selectedSessionId, selectedNewSlot, flashingPr, collapsedWorkflows, activitySortedTasks, restoredTaskId,
+    selectedSessionId, selectedNewSlot, flashingPr, collapsedWorkflows, collapsedSnoozed, activitySortedTasks, restoredTaskId,
     justFinished, unread, cardState, barWord, phaseOf, ADHOC_ID,
     // Duck-types the old Set-based ctx.subagentShown (cards.js only ever calls
     // .has(id)) while actually resolving the default-vs-explicit-override split.
@@ -1431,7 +1444,7 @@ function renderGrid() {
         // when none is registered, which is also what a disabled one contributes.
         const bodyPx = slots.taskBodyWeight(task.id, latestGraph);
         const { visible: childRowCount, absorbed: absorbedChildCount, workflowBoxCount, subagentRowCount, subagentZoneCount, fullView: childFullViewCount } = childRowCounts(sessions.filter((s) => phaseOf(s) !== 'asleep'));
-        return [task.id, { kind: 'task', id: task.id, task, sessions, span: tileSpan(sessions, perRow, bodyPx, phaseOf, childRowCount, absorbedChildCount, workflowBoxCount, subagentRowCount, subagentZoneCount, childFullViewCount) }];
+        return [task.id, { kind: 'task', id: task.id, task, sessions, span: tileSpan(sessions, perRow, bodyPx, phaseOf, childRowCount, absorbedChildCount, workflowBoxCount, subagentRowCount, subagentZoneCount, childFullViewCount, collapsedSnoozed.has(task.id)) }];
       })
     );
     const {
@@ -1439,7 +1452,7 @@ function renderGrid() {
       subagentRowCount: adhocSubagentRowCount, subagentZoneCount: adhocSubagentZoneCount, fullView: adhocChildFullViewCount,
     } = childRowCounts(adhocSessions.filter((s) => phaseOf(s) !== 'asleep'));
     const adhocBodyPx = slots.taskBodyWeight(ADHOC_ID, latestGraph);
-    tileById.set(ADHOC_ID, { kind: 'notask', id: ADHOC_ID, sessions: adhocSessions, span: tileSpan(adhocSessions, perRow, adhocBodyPx, phaseOf, adhocChildRowCount, adhocAbsorbedChildCount, adhocWorkflowBoxCount, adhocSubagentRowCount, adhocSubagentZoneCount, adhocChildFullViewCount) });
+    tileById.set(ADHOC_ID, { kind: 'notask', id: ADHOC_ID, sessions: adhocSessions, span: tileSpan(adhocSessions, perRow, adhocBodyPx, phaseOf, adhocChildRowCount, adhocAbsorbedChildCount, adhocWorkflowBoxCount, adhocSubagentRowCount, adhocSubagentZoneCount, adhocChildFullViewCount, collapsedSnoozed.has(ADHOC_ID)) });
     const tiles = visible.map((id) => tileById.get(id)).filter(Boolean);
     return computeLayout(tiles, columnsForWidth(el));
   }
@@ -1725,6 +1738,12 @@ function wireGridEvents(el) {
     head.addEventListener('click', () => toggleWorkflowCollapse(sid));
     head.addEventListener('keydown', (e) => {
       if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggleWorkflowCollapse(sid); }
+    });
+  });
+  el.querySelectorAll('.snooze-toggle').forEach((btn) => {
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      toggleSnoozedCollapse(btn.dataset.tile);
     });
   });
   el.querySelectorAll('.snoozed-row').forEach((row) => {
@@ -3448,6 +3467,7 @@ window.addEventListener('keydown', (e) => {
   if (e.key !== 'Enter' || e.metaKey || e.ctrlKey || e.altKey || e.shiftKey) return;
   if (selectedNewSlot == null) return;
   if (currentView !== 'grid' || cardMenuEl || isTypingTarget(document.activeElement)) return;
+  if (document.activeElement?.closest?.('.snooze-toggle')) return;
   if (document.querySelector('#modal:not(.hidden), [id$="-modal"]:not(.hidden)')) return;
   e.preventDefault();
   openDispatch(selectedNewSlot === ADHOC_ID ? null : selectedNewSlot);
