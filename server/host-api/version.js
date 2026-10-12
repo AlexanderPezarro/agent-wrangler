@@ -247,7 +247,13 @@ import semver from 'semver';
 // changed), the client `api.dispatch.submit({ model?, effort? })`, and
 // `quickLaunch` in the hideable dispatch fields (hiding it also frees ⌘1–⌘3
 // for the extension's own bindings). A manifest using any declares `^1.28.0`.
-export const HOST_API_VERSION = '1.28.0';
+//
+// 1.29.0 adds an optional `cost({ entry, liveSid })` to the runtime contract,
+// whose `{ usd }` replaces only the card's transcript-priced total, and passes
+// `parentId` to `wrapLaunch` on fork. An older server ignores `cost` (its loader
+// only checks the keys it knows), so the runtime still loads but shows the
+// transcript cost; a manifest that needs its own figure declares `^1.29.0`.
+export const HOST_API_VERSION = '1.29.0';
 
 // Does this server serve `range`? A null/absent range is "no constraint" and
 // passes — declaring the range is optional, getting it wrong is not.
