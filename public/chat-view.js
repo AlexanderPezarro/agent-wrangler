@@ -279,15 +279,49 @@ export function initChatView({ send, onSubagentClick, onOpenDiff, onGoTerminal, 
   // reader was actually trying to recover.
   //
   // Held per card id rather than simply cleared, so switching away does not throw
-  // away work in progress. In memory only, and deliberately not localStorage: an
-  // unsent prompt is a thing of the moment, and surviving a reload would put words
-  // in the composer the reader has long forgotten writing.
+  // away work in progress. Mirrored to localStorage so a reload (e.g. the UI
+  // restarting for an update) does not lose a long message either.
   //
   // Attachments travel WITH the text, because a pasted image's filename is only
   // meaningful inside the session whose pastes folder holds it — restoring the
   // prose without them would silently drop the images it refers to, and carrying
   // them to a DIFFERENT session is the leak this whole store exists to stop.
-  const drafts = new Map();
+  const DRAFTS_KEY = 'aw.chatDrafts';
+  const DRAFTS_MAX = 50;
+  function parseStoredDrafts(raw) {
+    try {
+      const parsed = JSON.parse(raw || '[]');
+      return Array.isArray(parsed) ? parsed.filter((e) => Array.isArray(e) && typeof e[0] === 'string' && typeof e[1]?.text === 'string' && Array.isArray(e[1].attachments)) : [];
+    } catch { return []; }
+  }
+  // Every read and write goes through storage rather than a private snapshot, so a
+  // second board tab never overwrites this one's drafts (or resurrects a sent one)
+  // from a stale copy. After a storage write fails, the in-memory map takes over
+  // so drafts still survive card switches.
+  class PersistedDrafts {
+    constructor() { this.memory = null; }
+    read() {
+      if (this.memory) return this.memory;
+      try { return new Map(parseStoredDrafts(localStorage.getItem(DRAFTS_KEY))); } catch { return new Map(); }
+    }
+    write(map) {
+      while (map.size > DRAFTS_MAX) map.delete(map.keys().next().value);
+      try { localStorage.setItem(DRAFTS_KEY, JSON.stringify([...map])); } catch { this.memory = map; }
+    }
+    get(k) { return this.read().get(k); }
+    set(k, v) {
+      const map = this.read();
+      map.delete(k);
+      map.set(k, v);
+      this.write(map);
+      return this;
+    }
+    delete(k) {
+      const map = this.read();
+      if (map.delete(k)) this.write(map);
+    }
+  }
+  const drafts = new PersistedDrafts();
 
   // Set when THIS view interrupted a turn: the interrupt is what may leave a
   // restored prompt in the PANE's composer, so the next send must clear it. Armed
@@ -565,6 +599,7 @@ export function initChatView({ send, onSubagentClick, onOpenDiff, onGoTerminal, 
     // fire, so a multi-line suggestion would land in a one-row box that hides
     // most of itself.
     input.dispatchEvent(new Event('input'));
+    scheduleDraftSave();
   }
 
   function renderSuggestion() {
@@ -690,7 +725,19 @@ export function initChatView({ send, onSubagentClick, onOpenDiff, onGoTerminal, 
       interruptAndRestore();
     }
   });
-  input.addEventListener('input', () => {
+  let draftTimer = null;
+  // Explicit rather than driven by every input event: mount's loadDraft dispatches
+  // a synthetic input, and treating that hydration as an edit would file one
+  // card's draft under another.
+  function scheduleDraftSave() {
+    if (!sessionId) return;
+    clearTimeout(draftTimer);
+    const id = sessionId;
+    const era = requestEra;
+    draftTimer = setTimeout(() => { if (sessionId === id && requestEra === era && !pendingMessages.has(id)) saveDraft(id); }, 400);
+  }
+  input.addEventListener('input', (e) => {
+    if (e.isTrusted) scheduleDraftSave();
     input.style.height = 'auto';
     // An unrendered element (display:none somewhere above — the sidebar hidden by
     // the diff view's fullscreen, the pane hidden on unmount) reports scrollHeight
@@ -756,23 +803,14 @@ export function initChatView({ send, onSubagentClick, onOpenDiff, onGoTerminal, 
         attachments = attachments.filter((x) => x !== a);
         renderAttachments();
         renderSendability();
+        scheduleDraftSave();
       });
       chip.appendChild(drop);
       attachEl.appendChild(chip);
     });
   }
 
-  input.addEventListener('paste', (e) => {
-    if (!sessionId) return;
-    const items = Array.from(e.clipboardData?.items || []);
-    const files = items
-      .filter((it) => it.kind === 'file' && typeof it.type === 'string' && it.type.startsWith('image/'))
-      .map((it) => it.getAsFile())
-      .filter(Boolean);
-    // No image on the clipboard means this is an ordinary text paste, which must
-    // fall through untouched — preventDefault here would break pasting text.
-    if (!files.length) return;
-    e.preventDefault();
+  function attachImageFiles(files) {
     const take = files.slice(0, MAX_IMAGES_PER_PASTE);
     const skipped = files.length - take.length;
     setPasteNote(take.length > 1 ? `Attaching ${take.length} images…` : 'Attaching image…');
@@ -800,6 +838,48 @@ export function initChatView({ send, onSubagentClick, onOpenDiff, onGoTerminal, 
       reader.readAsDataURL(file);
     }
     if (skipped > 0) setPasteNote(`Attaching ${take.length} images — ${skipped} more were skipped.`);
+  }
+
+  input.addEventListener('paste', (e) => {
+    if (!sessionId) return;
+    const items = Array.from(e.clipboardData?.items || []);
+    const files = items
+      .filter((it) => it.kind === 'file' && typeof it.type === 'string' && it.type.startsWith('image/'))
+      .map((it) => it.getAsFile())
+      .filter(Boolean);
+    // No image on the clipboard means this is an ordinary text paste, which must
+    // fall through untouched — preventDefault here would break pasting text.
+    if (!files.length) return;
+    e.preventDefault();
+    attachImageFiles(files);
+  });
+
+  // Ctrl+V is the terminal's paste key, and on macOS the browser fires no paste
+  // event for it, so muscle memory from the terminal pasted nothing here.
+  input.addEventListener('keydown', (e) => {
+    if (!isMac || !sessionId || !e.ctrlKey || e.metaKey || e.altKey || e.shiftKey || e.key.toLowerCase() !== 'v') return;
+    if (!navigator.clipboard?.read) return;
+    e.preventDefault();
+    const id = sessionId;
+    const era = requestEra;
+    const current = () => sessionId === id && requestEra === era && !pendingMessages.has(id);
+    navigator.clipboard.read().then(async (clipItems) => {
+      if (!current()) return;
+      const files = [];
+      let text = '';
+      for (const item of clipItems) {
+        const imgType = item.types.find((t) => t.startsWith('image/'));
+        if (imgType) files.push(new File([await item.getType(imgType)], 'paste', { type: imgType }));
+        else if (item.types.includes('text/plain')) text += await (await item.getType('text/plain')).text();
+      }
+      if (!current()) return;
+      if (files.length) attachImageFiles(files);
+      else if (text) {
+        input.setRangeText(text, input.selectionStart, input.selectionEnd, 'end');
+        input.dispatchEvent(new InputEvent('input', { bubbles: true }));
+        scheduleDraftSave();
+      }
+    }).catch(() => setPasteNote('Clipboard access was blocked — use Cmd+V to paste.'));
   });
 
   modelEl.addEventListener('click', () => {
@@ -957,6 +1037,7 @@ export function initChatView({ send, onSubagentClick, onOpenDiff, onGoTerminal, 
           attachments = pending.draft.attachments.slice();
           input.dispatchEvent(new Event('input'));
           renderAttachments();
+          saveDraft(msg.sessionId);
           const prefix = msg.outcome === 'unknown' ? 'Delivery status unknown' : 'Not sent';
           setPasteNote(`${prefix}: ${msg.error || 'check the terminal before sending again'}`);
           renderSendability();
@@ -1014,6 +1095,7 @@ export function initChatView({ send, onSubagentClick, onOpenDiff, onGoTerminal, 
       attachments.push({ name: msg.name });
       renderAttachments();
       renderSendability();
+      scheduleDraftSave();
       input.focus();
       // Cleared only once nothing is still in flight, so a multi-image paste does
       // not flash "done" while the rest are still uploading.
