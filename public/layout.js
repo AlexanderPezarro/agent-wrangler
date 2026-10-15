@@ -3,7 +3,7 @@
 // grid. Kept dependency-light (only snooze.js's tileWeight) and free of DOM/board state so it can be unit-tested —
 // the phase-dependent sorts take an injected `phaseOf(session)` predicate rather
 // than reaching for Date.now(), matching how snooze.js keeps `now` explicit.
-import { tileWeight } from './snooze.js';
+import { tileWeight, listedAsleep } from './snooze.js';
 
 // A nested child session (a workflow worker, or any other spawn absorbed into a
 // parent's spine — see workflow.js computeAbsorption) renders as a compact
@@ -462,8 +462,9 @@ export function tileSpan(
   sessions, perRow, bodyPx = 0, phaseOf, childRowCount = 0, absorbedChildCount = childRowCount, workflowBoxCount = 0,
   subagentRowCount = 0, subagentZoneCount = 0, childFullViewCount = 0, snoozedCollapsed = false,
 ) {
-  const snoozedCount = sessions.filter((s) => phaseOf(s) === 'asleep').length;
-  const topLevelActiveCount = sessions.length - snoozedCount - absorbedChildCount;
+  const snoozedCount = listedAsleep(sessions, phaseOf).length;
+  const asleepCount = sessions.filter((s) => phaseOf(s) === 'asleep').length;
+  const topLevelActiveCount = sessions.length - asleepCount - absorbedChildCount;
   const totalWeight = tileWeightWithBody({
     activeCount: topLevelActiveCount, snoozedCount, cardStride: CARD_STRIDE_PX, bodyPx, childRowCount, workflowBoxCount,
     subagentRowCount, subagentZoneCount, childFullViewCount, snoozedCollapsed,
