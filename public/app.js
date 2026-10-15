@@ -2049,13 +2049,17 @@ function extMenuItems(s) {
 function extTaskMenuItems(taskId, isNoTask) {
   const id = isNoTask ? ADHOC_ID : taskId;
   const task = isNoTask ? null : latestTasks.tasks.find((t) => t.id === taskId);
-  return slots.taskMenuItems({ id, name: task?.name ?? null, adhoc: isNoTask }, latestGraph, extApi).map((it) => ({
-    label: it.label,
-    icon: it.icon,
-    danger: it.danger,
-    run: it.run,
-    ...(it.hint ? { trailing: `<span class="context-menu-hint">${esc(it.hint)}</span>` } : {}),
-  }));
+  // Core carries Minimise in both task menus, so the legacy minimise-task
+  // extension's own item is dropped rather than shown twice.
+  return slots.taskMenuItems({ id, name: task?.name ?? null, adhoc: isNoTask }, latestGraph, extApi)
+    .filter((it) => !(it.extId === 'minimise-task' && it.label === 'Minimise'))
+    .map((it) => ({
+      label: it.label,
+      icon: it.icon,
+      danger: it.danger,
+      run: it.run,
+      ...(it.hint ? { trailing: `<span class="context-menu-hint">${esc(it.hint)}</span>` } : {}),
+    }));
 }
 
 function autoFixMenuItem(s) {
@@ -2438,6 +2442,7 @@ function openTaskMenu(cell, x, y) {
     ...(!isNoTask ? [
       { label: 'Rename', icon: PENCIL_ICON, run: () => beginTaskRename(cell) },
     ] : []),
+    { label: 'Minimise', icon: MINIMISE_ICON, run: () => minimise(isNoTask ? ADHOC_ID : taskId) },
     ...(extItems.length ? [{ sep: true }, ...extItems] : []),
     ...(!isNoTask ? [
       { sep: true },
