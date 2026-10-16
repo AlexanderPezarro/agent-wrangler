@@ -223,3 +223,67 @@ test('waitForCompactionEnd: idle pane returns immediately; compacting pane waits
   assert.equal(await waitForCompactionEnd('p', '', { capture: async () => frames.shift() ?? idle, sleep: async () => {} }), 'finished');
   assert.equal(await waitForCompactionEnd('p', '', { capture: async () => compacting, sleep: async () => {}, timeoutMs: -1 }), 'timeout');
 });
+
+test('startup readiness accepts a working composer and an existing draft without requiring emptiness', async () => {
+  for (const pane of [`${working}\n${codexEmpty}`, codexHolding, claudeComposer('restored draft'), claudeComposer('\u00a0')]) {
+    assert.equal(await waitForComposerReady('p', '', pane.includes('❯') ? 'claude' : 'codex', {
+      requireEmpty: false, capture: async () => pane, timeoutMs: 0, sleep: nowait,
+    }), true);
+  }
+});
+
+test('startup readiness needs a composer even when a working status is present', async () => {
+  for (const pane of [booting, working, `${updateMenu}\n${codexEmpty}`]) {
+    assert.equal(await waitForComposerReady('p', '', 'codex', {
+      requireEmpty: false, capture: async () => pane, timeoutMs: 0, sleep: nowait,
+    }), false);
+  }
+});
+
+const claudeRule = '─'.repeat(60);
+const claudeComposer = (draft = '') => `${claudeRule}\n${claudeEmpty}${draft}\n${claudeRule}\nHaiku 5.5\nauto mode on`;
+
+test('startup readiness rejects selection cursors and history echoes', async () => {
+  const panes = [
+    ['Resume this session?', '❯ 1. Resume from summary (recommended)', '  2. Resume full session as-is', "  3. Don't ask me again"].join('\n'),
+    ['Resume this session?', '❯ Resume from summary (recommended)', '  Resume full session as-is', "  Don't ask me again"].join('\n'),
+    ['Allow this tool?', '❯ 1. Yes', '  2. No'].join('\n'),
+    ['❯ fix the flaky test', '⏺ Done'].join('\n'),
+  ];
+  for (const pane of panes) {
+    assert.equal(await waitForComposerReady('p', '', 'claude', {
+      requireEmpty: false, capture: async () => pane, timeoutMs: 0,
+    }), false, pane);
+  }
+  assert.equal(await waitForComposerReady('p', '', 'codex', {
+    requireEmpty: false, capture: async () => `${ESC}[1;2m› old prompt${ESC}[0m\nDone`, timeoutMs: 0,
+  }), false);
+});
+
+test('startup readiness accepts a framed Claude draft with several wrapped lines', async () => {
+  assert.equal(await waitForComposerReady('p', '', 'claude', {
+    requireEmpty: false,
+    capture: async () => claudeComposer('first line\n  second line\n  third line\n  fourth line\n  fifth line'),
+    timeoutMs: 0,
+  }), true);
+});
+
+test('startup readiness rejects styled Codex startup and selection menus', async () => {
+  const panes = [
+    `Trust this folder?\n${ESC}[1m› 1. Trust and continue${ESC}[0m\n  2. Quit\n  enter continue · esc quit`,
+    `Background server settings differ\n  1. Run without daemon this time\n  2. Restart with these settings\n${ESC}[1;7m› 3. Cancel${ESC}[0m`,
+    `${codexEmpty}\n  ? for shortcuts\nReplace goal?\n${ESC}[1m› 1. Replace current goal${ESC}[0m\n  2. Cancel\n  enter select · esc back`,
+  ];
+  for (const pane of panes) {
+    assert.equal(await waitForComposerReady('p', '', 'codex', {
+      requireEmpty: false, capture: async () => pane, timeoutMs: 0,
+    }), false, pane);
+  }
+});
+
+test('startup readiness accepts a numbered Codex draft and selection hints quoted inside it', async () => {
+  const pane = `${ESC}[1m›${ESC}[0m 1. first item\n  2. second item\n  enter continue · esc quit\n  GPT-6-Luna medium · /tmp/example\n  warnings`;
+  assert.equal(await waitForComposerReady('p', '', 'codex', {
+    requireEmpty: false, capture: async () => pane, timeoutMs: 0,
+  }), true);
+});
